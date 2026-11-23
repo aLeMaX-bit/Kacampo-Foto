@@ -1,0 +1,548 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Buat proyek
+        run: |
+          cat > settings.gradle.kts <<'EOF_0'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "FastMerge"
+          include(":app")
+          EOF_0
+          cat > build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_1
+          cat > gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_2
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.fastmerge"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.fastmerge"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+                      // ditandatangani dengan debug key supaya langsung bisa dipasang
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+          }
+
+          dependencies {
+              implementation("androidx.activity:activity-ktx:1.9.0")
+              implementation("androidx.recyclerview:recyclerview:1.3.2")
+              implementation("androidx.exifinterface:exifinterface:1.3.7")
+          }
+          EOF_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <!-- Sengaja TANPA permission INTERNET: aplikasi 100% offline dan tanpa iklan -->
+              <application
+                  android:allowBackup="false"
+                  android:label="Fast Merge"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_4
+          mkdir -p app/src/main/java/com/fastmerge
+          cat > app/src/main/java/com/fastmerge/MainActivity.kt <<'EOF_5'
+          package com.fastmerge
+
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.BitmapShader
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Matrix
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.graphics.Shader
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.PickVisualMediaRequest
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.exifinterface.media.ExifInterface
+          import androidx.recyclerview.widget.ItemTouchHelper
+          import androidx.recyclerview.widget.LinearLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import java.util.concurrent.Executors
+          import kotlin.math.ceil
+          import kotlin.math.max
+          import kotlin.math.min
+
+          private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+          private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+          private const val MAX_PIXELS = 36_000_000L   // batas aman memori
+          private const val MAX_SIDE = 16000
+          private const val MAX_BASE = 2000f           // lebar/tinggi dasar maksimal hasil
+
+          class MainActivity : ComponentActivity() {
+
+              private class Info(val uri: Uri, val w: Int, val h: Int, val rot: Int)
+              private class VH(val row: LinearLayout, val img: ImageView, val num: TextView, val del: TextView) :
+                  RecyclerView.ViewHolder(row)
+
+              private val uris = ArrayList<Uri>()
+              private val thumbs = android.util.LruCache<Uri, Bitmap>(80)
+              private val cores = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+              private val pool = Executors.newFixedThreadPool(cores)
+              private val thumbPool = Executors.newFixedThreadPool(2)
+              private val work = Executors.newSingleThreadExecutor()
+
+              private var horizontal = false
+              private var bg = Color.WHITE
+              private var frameP = 0
+              private var gapP = 0
+              private var radP = 0
+              private var lastSaved: Uri? = null
+
+              private lateinit var list: RecyclerView
+              private lateinit var empty: TextView
+              private lateinit var saveBtn: Button
+              private lateinit var status: TextView
+
+              private val picker =
+                  registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { r ->
+                      if (r.isNotEmpty()) {
+                          uris.addAll(r)
+                          list.adapter?.notifyDataSetChanged()
+                          refresh()
+                      }
+                  }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#F1F3F8"))
+                      setPadding(dp(12), dp(28), dp(12), dp(12))
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "Fast Merge"
+                      textSize = 22f
+                      setTextColor(Color.parseColor("#1F3A93"))
+                      setPadding(dp(4), 0, 0, dp(8))
+                  })
+
+                  // Tombol atas
+                  val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val add = Button(this).apply { text = "Tambah gambar"; setOnClickListener {
+                      picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                  } }
+                  val clear = Button(this).apply { text = "Bersihkan"; setOnClickListener {
+                      uris.clear(); list.adapter?.notifyDataSetChanged(); refresh()
+                  } }
+                  top.addView(add, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  top.addView(clear, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  root.addView(top)
+
+                  // Daftar gambar
+                  val frame = android.widget.FrameLayout(this)
+                  list = RecyclerView(this).apply {
+                      layoutManager = LinearLayoutManager(this@MainActivity)
+                      adapter = Adapter()
+                      setHasFixedSize(true)
+                  }
+                  empty = TextView(this).apply {
+                      text = "Belum ada gambar.\nKetuk “Tambah gambar”.\nTahan lama lalu geser untuk atur urutan."
+                      gravity = Gravity.CENTER
+                      setTextColor(Color.GRAY)
+                  }
+                  frame.addView(list, MATCH, MATCH)
+                  frame.addView(empty, android.widget.FrameLayout.LayoutParams(MATCH, MATCH))
+                  root.addView(frame, LinearLayout.LayoutParams(MATCH, 0, 1f))
+
+                  ItemTouchHelper(object : ItemTouchHelper.SimpleCallback(
+                      ItemTouchHelper.UP or ItemTouchHelper.DOWN, 0
+                  ) {
+                      override fun onMove(
+                          rv: RecyclerView, a: RecyclerView.ViewHolder, b: RecyclerView.ViewHolder
+                      ): Boolean {
+                          val f = a.bindingAdapterPosition
+                          val t = b.bindingAdapterPosition
+                          if (f < 0 || t < 0) return false
+                          uris.add(t, uris.removeAt(f))
+                          rv.adapter?.notifyItemMoved(f, t)
+                          return true
+                      }
+
+                      override fun onSwiped(vh: RecyclerView.ViewHolder, d: Int) {}
+
+                      override fun clearView(rv: RecyclerView, vh: RecyclerView.ViewHolder) {
+                          super.clearView(rv, vh)
+                          rv.post { rv.adapter?.notifyDataSetChanged() }
+                      }
+                  }).attachToRecyclerView(list)
+
+                  // Pengaturan
+                  val rg = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+                  val rv = RadioButton(this).apply { text = "Vertikal"; id = View.generateViewId() }
+                  val rh = RadioButton(this).apply { text = "Horizontal"; id = View.generateViewId() }
+                  rg.addView(rv); rg.addView(rh)
+                  rg.check(rv.id)
+                  rg.setOnCheckedChangeListener { _, id -> horizontal = (id == rh.id) }
+                  root.addView(rg)
+
+                  root.addView(seekRow("Bingkai") { frameP = it })
+                  root.addView(seekRow("Spasi") { gapP = it })
+                  root.addView(seekRow("Radius") { radP = it })
+
+                  val colorRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(0, dp(8), 0, dp(8))
+                  }
+                  colorRow.addView(TextView(this).apply { text = "Latar" }, LinearLayout.LayoutParams(dp(70), WRAP))
+                  intArrayOf(
+                      Color.WHITE, Color.BLACK, 0xFF2962FF.toInt(),
+                      0xFFE53935.toInt(), 0xFF43A047.toInt(), 0xFFFFB300.toInt()
+                  ).forEach { c ->
+                      val v = View(this)
+                      v.background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(c)
+                          setStroke(dp(1), 0xFF999999.toInt())
+                      }
+                      v.setOnClickListener { bg = c }
+                      colorRow.addView(v, LinearLayout.LayoutParams(dp(34), dp(34)).apply { rightMargin = dp(12) })
+                  }
+                  root.addView(colorRow)
+
+                  saveBtn = Button(this).apply {
+                      text = "GABUNG & SIMPAN"
+                      setOnClickListener { doMerge() }
+                  }
+                  root.addView(saveBtn, LinearLayout.LayoutParams(MATCH, WRAP))
+
+                  status = TextView(this).apply {
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(6), 0, 0)
+                      setOnClickListener {
+                          lastSaved?.let {
+                              startActivity(Intent(Intent.ACTION_VIEW).apply {
+                                  setDataAndType(it, "image/jpeg")
+                                  addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                              })
+                          }
+                      }
+                  }
+                  root.addView(status)
+
+                  setContentView(root)
+                  refresh()
+              }
+
+              private fun seekRow(label: String, onChange: (Int) -> Unit): View {
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  row.addView(TextView(this).apply { text = label }, LinearLayout.LayoutParams(dp(70), WRAP))
+                  val sb = SeekBar(this).apply {
+                      max = 100
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) = onChange(p)
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  }
+                  row.addView(sb, LinearLayout.LayoutParams(0, WRAP, 1f))
+                  return row
+              }
+
+              private fun refresh() {
+                  empty.visibility = if (uris.isEmpty()) View.VISIBLE else View.GONE
+                  saveBtn.isEnabled = uris.size >= 2
+              }
+
+              // ---------- Daftar gambar ----------
+              private inner class Adapter : RecyclerView.Adapter<VH>() {
+                  override fun getItemCount() = uris.size
+
+                  override fun onCreateViewHolder(p: ViewGroup, t: Int): VH {
+                      val row = LinearLayout(this@MainActivity).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          setBackgroundColor(Color.WHITE)
+                          setPadding(dp(8), dp(4), dp(8), dp(4))
+                          layoutParams = RecyclerView.LayoutParams(MATCH, WRAP).apply { bottomMargin = dp(3) }
+                      }
+                      val num = TextView(this@MainActivity).apply { textSize = 16f; gravity = Gravity.CENTER }
+                      val img = ImageView(this@MainActivity).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+                      val del = TextView(this@MainActivity).apply {
+                          text = "✕"; textSize = 18f; setPadding(dp(16), dp(8), dp(8), dp(8))
+                      }
+                      row.addView(num, LinearLayout.LayoutParams(dp(32), WRAP))
+                      row.addView(img, LinearLayout.LayoutParams(dp(64), dp(64)))
+                      row.addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f))
+                      row.addView(del)
+                      val h = VH(row, img, num, del)
+                      del.setOnClickListener {
+                          val pos = h.bindingAdapterPosition
+                          if (pos >= 0) {
+                              uris.removeAt(pos)
+                              notifyItemRemoved(pos)
+                              notifyItemRangeChanged(pos, uris.size - pos)
+                              refresh()
+                          }
+                      }
+                      return h
+                  }
+
+                  override fun onBindViewHolder(h: VH, pos: Int) {
+                      val u = uris[pos]
+                      h.num.text = "${pos + 1}"
+                      h.img.tag = u
+                      val c = thumbs.get(u)
+                      if (c != null) {
+                          h.img.setImageBitmap(c)
+                      } else {
+                          h.img.setImageDrawable(null)
+                          thumbPool.execute {
+                              val b = try { decodeThumb(u) } catch (e: Throwable) { null }
+                              if (b != null) {
+                                  thumbs.put(u, b)
+                                  runOnUiThread { if (h.img.tag == u) h.img.setImageBitmap(b) }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              // ---------- Decode ----------
+              private fun info(u: Uri): Info {
+                  val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  contentResolver.openInputStream(u)!!.use { BitmapFactory.decodeStream(it, null, o) }
+                  val rot = contentResolver.openInputStream(u)!!.use {
+                      when (ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1)) {
+                          6 -> 90; 3 -> 180; 8 -> 270; else -> 0
+                      }
+                  }
+                  return if (rot == 90 || rot == 270) Info(u, o.outHeight, o.outWidth, rot)
+                  else Info(u, o.outWidth, o.outHeight, rot)
+              }
+
+              /** Decode hemat memori: hanya sebesar yang dibutuhkan (targetW = lebar tampilan akhir). */
+              private fun decode(i: Info, targetW: Int): Bitmap {
+                  var s = 1
+                  while (i.w / (s * 2) >= targetW) s *= 2
+                  val o = BitmapFactory.Options().apply { inSampleSize = s }
+                  var b = contentResolver.openInputStream(i.uri)!!.use { BitmapFactory.decodeStream(it, null, o) }!!
+                  if (i.rot != 0) {
+                      val m = Matrix().apply { postRotate(i.rot.toFloat()) }
+                      val r = Bitmap.createBitmap(b, 0, 0, b.width, b.height, m, true)
+                      b.recycle()
+                      b = r
+                  }
+                  return b
+              }
+
+              private fun decodeThumb(u: Uri): Bitmap {
+                  val i = info(u)
+                  val tw = if (i.w >= i.h) 192 else max(1, 192 * i.w / i.h)
+                  return decode(i, tw)
+              }
+
+              // ---------- Gabung ----------
+              private class Layout(val rects: List<RectF>, val w: Int, val h: Int)
+
+              private fun layout(infos: List<Info>, base: Float): Layout {
+                  val unit = base / 1000f
+                  val f = frameP * unit
+                  val g = gapP * unit
+                  val rects = ArrayList<RectF>(infos.size)
+                  var pos = f
+                  for (i in infos) {
+                      if (horizontal) {
+                          val w = i.w * base / i.h
+                          rects.add(RectF(pos, f, pos + w, f + base)); pos += w + g
+                      } else {
+                          val h = i.h * base / i.w
+                          rects.add(RectF(f, pos, f + base, pos + h)); pos += h + g
+                      }
+                  }
+                  val total = pos - g + f
+                  val ow = if (horizontal) total else base + 2 * f
+                  val oh = if (horizontal) base + 2 * f else total
+                  return Layout(rects, ceil(ow).toInt(), ceil(oh).toInt())
+              }
+
+              private fun mergeBitmap(): Bitmap {
+                  val infos = uris.toList().map { u -> pool.submit<Info> { info(u) } }.map { it.get() }
+                  var base = min(
+                      if (horizontal) infos.maxOf { it.h }.toFloat() else infos.maxOf { it.w }.toFloat(),
+                      MAX_BASE
+                  )
+                  var L = layout(infos, base)
+                  while (L.w.toLong() * L.h > MAX_PIXELS || max(L.w, L.h) > MAX_SIDE) {
+                      base *= 0.9f
+                      L = layout(infos, base)
+                  }
+
+                  val out = Bitmap.createBitmap(L.w, L.h, Bitmap.Config.ARGB_8888)
+                  val cv = Canvas(out)
+                  cv.drawColor(bg)
+                  val plain = Paint(Paint.FILTER_BITMAP_FLAG)
+                  val round = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                  val radius = radP * base / 1000f
+
+                  var idx = 0
+                  while (idx < infos.size) {
+                      val end = min(idx + cores, infos.size)
+                      // decode paralel per batch, gambar berurutan
+                      val futs = (idx until end).map { j ->
+                          pool.submit<Bitmap> { decode(infos[j], ceil(L.rects[j].width()).toInt()) }
+                      }
+                      futs.forEachIndexed { n, fu ->
+                          val b = fu.get()
+                          val r = L.rects[idx + n]
+                          if (radius > 0f) {
+                              val sh = BitmapShader(b, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                              val m = Matrix()
+                              m.setRectToRect(
+                                  RectF(0f, 0f, b.width.toFloat(), b.height.toFloat()), r, Matrix.ScaleToFit.FILL
+                              )
+                              sh.setLocalMatrix(m)
+                              round.shader = sh
+                              cv.drawRoundRect(r, radius, radius, round)
+                          } else {
+                              cv.drawBitmap(b, null, r, plain)
+                          }
+                          b.recycle()
+                      }
+                      idx = end
+                  }
+                  return out
+              }
+
+              private fun saveBitmap(bm: Bitmap): Uri? {
+                  val v = ContentValues().apply {
+                      put(MediaStore.Images.Media.DISPLAY_NAME, "Merge_${System.currentTimeMillis()}.jpg")
+                      put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                      put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FastMerge")
+                      put(MediaStore.Images.Media.IS_PENDING, 1)
+                  }
+                  val u = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: return null
+                  contentResolver.openOutputStream(u)!!.use { bm.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                  v.clear()
+                  v.put(MediaStore.Images.Media.IS_PENDING, 0)
+                  contentResolver.update(u, v, null, null)
+                  return u
+              }
+
+              private fun doMerge() {
+                  if (uris.size < 2) {
+                      Toast.makeText(this, "Pilih minimal 2 gambar", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  saveBtn.isEnabled = false
+                  status.text = "Memproses…"
+                  work.execute {
+                      val t0 = System.currentTimeMillis()
+                      try {
+                          val bm = mergeBitmap()
+                          val u = saveBitmap(bm)
+                          bm.recycle()
+                          val ms = System.currentTimeMillis() - t0
+                          runOnUiThread {
+                              lastSaved = u
+                              status.text = "Tersimpan di Pictures/FastMerge (${ms} ms) · ketuk untuk lihat"
+                              saveBtn.isEnabled = true
+                          }
+                      } catch (e: Throwable) {
+                          runOnUiThread {
+                              status.text = "Gagal: ${e.message ?: e.javaClass.simpleName}"
+                              saveBtn.isEnabled = true
+                          }
+                      }
+                  }
+              }
+          }
+          EOF_5
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Build APK
+        run: gradle assembleRelease --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FastMerge-apk
+          path: app/build/outputs/apk/release/*.apk
